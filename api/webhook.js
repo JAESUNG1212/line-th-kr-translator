@@ -16,7 +16,7 @@ import fetch from "node-fetch";
 
 // ---- 환경변수
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // 기본 gpt-4o-mini 권장
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o"; // 기본 gpt-4o-mini 권장
 const BACKLITERAL = (process.env.BACKLITERAL || "on").toLowerCase() !== "off"; // 직역줄 on/off
 
 // ---- 상수
