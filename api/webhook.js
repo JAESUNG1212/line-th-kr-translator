@@ -1,117 +1,230 @@
+// api/webhook.js
 import fetch from "node-fetch";
 
-// 입력이 한국어일 때: 태국어 번역 + 한국어 직역(백번역)을 같이 보내고,
-// 입력이 태국어일 때: 한국어 번역만 보냅니다.
-// '깨우'는 반드시 'แก้ว'로 번역, 남성 존댓말 톤, 웃음치환 포함.
+/**
+ * ─────────────────────────────────────────────────────────────────
+ * 안정판 번역 Webhook
+ *  - 오직 번역만 (설명/잡담 금지)
+ *  - 항상 “친근한 존댓말” 번역
+ *  - TH->KR: 한국어는 ~요/해요
+ *  - KR->TH: 태국어는 남성 존댓말(ครับ) + “깨우”는 고유명사 “แก้ว”로
+ *  - JSON 강제 & 파싱 보정, 실패시 단문 대체, 429 자동 재시도
+ *  - LINE 메시지 길이(2,000자) 안전 가드
+ * ─────────────────────────────────────────────────────────────────
+ */
 
-const SYSTEM_PROMPT = `
-You are a bilingual translator for a Korean man and his Thai girlfriend on LINE.
+// ---- 환경변수
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini"; // 기본 gpt-4o-mini 권장
+const BACKLITERAL = (process.env.BACKLITERAL || "on").toLowerCase() !== "off"; // 직역줄 on/off
 
-Global style & rules:
-- Male polite tone (ครับ) in Thai outputs when translating from Korean.
-- Natural friendly polite tone in Korean outputs when translating from Thai.
-- If the Korean input contains the name "깨우", always translate it as "แก้ว" in Thai.
-- Laughter mapping: ㅋㅋ / ㅎㅎ / 하하 <-> 555 / ฮ่าๆ
-- Do not add explanations.
+// ---- 상수
+const LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply";
+const LINE_MAX = 2000; // LINE text message 최대 길이
 
-Output format:
-- If the INPUT is Korean (KR→TH):
-  Return STRICT JSON (no code fences, no extra text):
-  {
-    "mode": "KR→TH",
-    "th": "<Thai translation only, no Hangul, male polite tone>",
-    "ko_backliteral": "<literal back-translation to Korean of your Thai output>"
-  }
-- If the INPUT is Thai (TH→KR):
-  Return STRICT JSON:
-  {
-    "mode": "TH→KR",
-    "ko": "<natural Korean translation in friendly polite male tone>"
-  }
-Ensure valid JSON. Do not include any additional keys or commentary.
-`;
+// ---- 유틸
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(200).send("OK");
-
-  const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-  const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-
-  const events = req.body?.events || [];
-
-  for (const event of events) {
-    try {
-      if (event.type !== "message" || event.message?.type !== "text") continue;
-
-      const userText = event.message.text ?? "";
-
-      // 1) GPT에게 번역 + 구조화(JSON) 요청
-      const gpt = await fetch("https://api.openai.com/v1/chat/completions", {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          model: "gpt-4o-mini",
-          temperature: 0.4,
-          messages: [
-            { role: "system", content: SYSTEM_PROMPT.trim() },
-            { role: "user", content: userText },
-          ],
-        }),
-      }).then((r) => r.json());
-
-      const raw = gpt?.choices?.[0]?.message?.content?.trim() || "";
-      const data = safeParseJSON(raw);
-
-      // 2) LINE으로 응답 구성
-      let messages = [];
-      if (data && data.mode === "KR→TH" && typeof data.th === "string") {
-        // 첫 줄: 태국어 번역
-        messages.push({ type: "text", text: data.th.slice(0, 1900) });
-        // 둘째 줄: 한국어 직역(백번역)
-        if (typeof data.ko_backliteral === "string" && data.ko_backliteral.length) {
-          messages.push({ type: "text", text: `(직역) ${data.ko_backliteral.slice(0, 1900)}` });
-        }
-      } else if (data && data.mode === "TH→KR" && typeof data.ko === "string") {
-        messages.push({ type: "text", text: data.ko.slice(0, 1900) });
-      } else {
-        // 파싱 실패 시 대비: 원문 그대로 에코 (디버그용)
-        messages.push({ type: "text", text: "번역 형식 파싱에 실패했어요. 다시 한번 보내주세요." });
-      }
-
-      // 3) 답장 보내기
-      await replyToLine(event.replyToken, messages, LINE_TOKEN);
-
-    } catch (e) {
-      console.error("Event error:", e);
-      // 에러가 있어도 200 반환(라인 재시도 방지)
-    }
-  }
-
-  return res.status(200).send("OK");
+function trimFence(s) {
+  if (!s) return s;
+  // ```json ... ```
+  return s
+    .replace(/^```json\s*/i, "")
+    .replace(/```$/i, "")
+    .trim();
 }
 
-function safeParseJSON(s) {
+function safeParseJSON(str) {
   try {
-    return JSON.parse(s);
+    if (typeof str !== "string") return null;
+    const cleaned = trimFence(str);
+    return JSON.parse(cleaned);
   } catch {
     return null;
   }
 }
 
-async function replyToLine(replyToken, messages, LINE_TOKEN) {
-  // LINE은 한 번에 최대 5개 메시지까지 허용
-  await fetch("https://api.line.me/v2/bot/message/reply", {
+function detectThai(text) {
+  // 태국어 유니코드 블록 포함 여부
+  return /[\u0E00-\u0E7F]/.test(text);
+}
+
+function truncateLine(s, limit = LINE_MAX) {
+  if (typeof s !== "string") return "";
+  if (s.length <= limit) return s;
+  return s.slice(0, limit - 1) + "…";
+}
+
+// ---- OpenAI 호출 (429 재시도, 타임아웃 보장)
+async function askOpenAI(messages, { timeoutMs = 15000 } = {}) {
+  const controller = new AbortController();
+  const t = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const res = await fetch("https://api.openai.com/v1/chat/completions", {
+      method: "POST",
+      signal: controller.signal,
+      headers: {
+        "Authorization": `Bearer ${OPENAI_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0.2,
+        response_format: { type: "json_object" },
+        messages,
+      }),
+    });
+
+    const status = res.status;
+    const raw = await res.text();
+    return { ok: res.ok, status, raw };
+  } catch (e) {
+    return { ok: false, status: 0, raw: String(e?.message || e) };
+  } finally {
+    clearTimeout(t);
+  }
+}
+
+async function askWithRetry(messages, { timeoutMs = 15000, retries = 2 } = {}) {
+  let last;
+  for (let i = 0; i <= retries; i++) {
+    last = await askOpenAI(messages, { timeoutMs });
+    if (last?.status === 429 && i < retries) {
+      // 429면 점진 백오프 후 재시도
+      await sleep(800 * (i + 1));
+      continue;
+    }
+    return last;
+  }
+  return last;
+}
+
+// ---- LINE Reply
+async function lineReply(replyToken, texts = []) {
+  // 항상 최소 1줄 보장
+  const messages =
+    texts.length > 0
+      ? texts.map((t) => ({ type: "text", text: truncateLine(t) }))
+      : [{ type: "text", text: "번역에 실패했어요. 다시 시도해 주세요." }];
+
+  const res = await fetch(LINE_REPLY_URL, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${LINE_TOKEN}`,
       "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
     },
-    body: JSON.stringify({
-      replyToken,
-      messages,
-    }),
+    body: JSON.stringify({ replyToken, messages }),
   });
+
+  // LINE 응답도 로깅
+  const raw = await res.text();
+  if (!res.ok) {
+    console.error("LINE Reply Error:", res.status, raw);
+  }
+}
+
+// ---- System Prompt (JSON 강제)
+const SYSTEM_PROMPT = `
+You are a strict translation engine for a Korean man and his Thai girlfriend on LINE.
+Return a pure JSON object ONLY (no code fence, no commentary).
+
+Rules:
+- Detect source: if input has Thai letters → translate to Korean.
+- Otherwise → translate to Thai.
+- KR → TH: Use friendly polite Thai for a male speaker (end with "ครับ"), and whenever "깨우" is a name, use the Thai proper name "แก้ว". Do not translate names other than mapping "깨우" → "แก้ว".
+- TH → KR: Use friendly polite Korean (~요/해요).
+- No extra comments, no emojis, no examples.
+- Never add explanations.
+- Keep it natural, concise, and conversation-ready.
+
+Return JSON:
+{
+  "translated": "<final natural translation>",
+  "literal": "<literal/word-by-word if helpful, otherwise empty string>"
+}
+`;
+
+// ---- 사용자 프롬프트 생성
+function buildUserPrompt(userText, sourceIsThai) {
+  return `
+Input:
+${userText}
+
+Meta:
+- Source: ${sourceIsThai ? "TH" : "KR"}
+- Target: ${sourceIsThai ? "KR" : "TH"}
+- Only translate. No extra comments.
+- Keep honorific style (${sourceIsThai ? "KR: 친근한 존댓말(요/해요)" : "TH: 남성 존댓말(ครับ)"}).
+`;
+}
+
+// ---- 메인 핸들러
+export default async function handler(req, res) {
+  // 기본 200 빠른 반환(중복 콜 회피용)
+  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  if (!OPENAI_API_KEY) return res.status(500).send("Missing OPENAI_API_KEY");
+
+  try {
+    const body = typeof req.body === "string" ? JSON.parse(req.body) : req.body;
+    const events = body?.events || [];
+    if (!Array.isArray(events) || events.length === 0) {
+      return res.status(200).json({ ok: true });
+    }
+
+    for (const event of events) {
+      const replyToken = event?.replyToken;
+      const text = event?.message?.text;
+
+      // 텍스트 메시지 외는 무시
+      if (!replyToken || !text || event.type !== "message") continue;
+
+      const isThai = detectThai(text);
+
+      const messages = [
+        { role: "system", content: SYSTEM_PROMPT.trim() },
+        { role: "user", content: buildUserPrompt(text, isThai).trim() },
+      ];
+
+      // OpenAI 호출 (재시도 포함)
+      const { ok, status, raw } = await askWithRetry(messages, {
+        timeoutMs: 15000,
+        retries: 2,
+      });
+
+      // 디버깅 로그(필요 시 확인)
+      console.log("OpenAI status:", status);
+      console.log("RAW GPT:", raw?.slice(0, 2000)); // 너무 길면 자름
+
+      let outTexts = [];
+
+      if (ok) {
+        const parsed = safeParseJSON(raw);
+        const translated = parsed?.translated?.toString()?.trim() || "";
+        const literal = parsed?.literal?.toString()?.trim() || "";
+
+        if (translated) {
+          outTexts.push(translated);
+          if (BACKLITERAL && literal) {
+            outTexts.push(`(직역) ${literal}`);
+          }
+        } else {
+          // 파싱 실패/빈 결과 → 단문 대체
+          outTexts = ["번역에 실패했어요. 다시 시도해 주세요."];
+        }
+      } else {
+        // 401/429/timeout 등 실패 시 단문 대체
+        outTexts = ["번역에 실패했어요. 다시 시도해 주세요."];
+        console.error("OpenAI error:", status, raw);
+      }
+
+      await lineReply(replyToken, outTexts);
+    }
+
+    return res.status(200).json({ ok: true });
+  } catch (e) {
+    console.error("Webhook error:", e);
+    // 아주 마지막 안전망: 실패해도 200으로 끝내되, 라인에는 최소 1줄 보냄(위에서 이미 보냄)
+    return res.status(200).json({ ok: false });
+  }
 }
