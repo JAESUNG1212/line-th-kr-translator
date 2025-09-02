@@ -3,13 +3,14 @@ import fetch from "node-fetch";
 
 /**
  * ─────────────────────────────────────────────────────────────────
- * 안정판 번역 Webhook
+ * 안정판 번역 Webhook (버그 수정版)
  *  - 오직 번역만 (설명/잡담 금지)
  *  - 항상 “친근한 존댓말” 번역
  *  - TH->KR: 한국어는 ~요/해요
  *  - KR->TH: 태국어는 남성 존댓말(ครับ) + “깨우”는 고유명사 “แก้ว”로
  *  - JSON 강제 & 파싱 보정, 실패시 단문 대체, 429 자동 재시도
  *  - LINE 메시지 길이(2,000자) 안전 가드
+ *  - ❗ OpenAI 응답 파싱 버그 수정: choices[0].message.content 를 사용
  * ─────────────────────────────────────────────────────────────────
  */
 
@@ -56,6 +57,7 @@ function truncateLine(s, limit = LINE_MAX) {
 }
 
 // ---- OpenAI 호출 (429 재시도, 타임아웃 보장)
+// ❗ 수정: API 전체 raw 텍스트가 아니라, data.choices[0].message.content 를 뽑아 반환
 async function askOpenAI(messages, { timeoutMs = 15000 } = {}) {
   const controller = new AbortController();
   const t = setTimeout(() => controller.abort(), timeoutMs);
@@ -77,10 +79,18 @@ async function askOpenAI(messages, { timeoutMs = 15000 } = {}) {
     });
 
     const status = res.status;
-    const raw = await res.text();
-    return { ok: res.ok, status, raw };
+    const data = await res.json().catch(() => null);
+
+    if (!res.ok || !data) {
+      return { ok: false, status, content: null, errorRaw: JSON.stringify(data) };
+    }
+
+    const content =
+      data?.choices?.[0]?.message?.content?.toString() ?? "";
+
+    return { ok: true, status, content, errorRaw: null };
   } catch (e) {
-    return { ok: false, status: 0, raw: String(e?.message || e) };
+    return { ok: false, status: 0, content: null, errorRaw: String(e?.message || e) };
   } finally {
     clearTimeout(t);
   }
@@ -161,7 +171,6 @@ Meta:
 
 // ---- 메인 핸들러
 export default async function handler(req, res) {
-  // 기본 200 빠른 반환(중복 콜 회피용)
   if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
   if (!OPENAI_API_KEY) return res.status(500).send("Missing OPENAI_API_KEY");
 
@@ -187,19 +196,21 @@ export default async function handler(req, res) {
       ];
 
       // OpenAI 호출 (재시도 포함)
-      const { ok, status, raw } = await askWithRetry(messages, {
+      const { ok, status, content, errorRaw } = await askWithRetry(messages, {
         timeoutMs: 15000,
         retries: 2,
       });
 
-      // 디버깅 로그(필요 시 확인)
+      // 디버깅 로그
       console.log("OpenAI status:", status);
-      console.log("RAW GPT:", raw?.slice(0, 2000)); // 너무 길면 자름
+      if (content) console.log("CONTENT:", content.slice(0, 1000));
+      if (errorRaw) console.log("OpenAI errorRaw:", errorRaw);
 
       let outTexts = [];
 
-      if (ok) {
-        const parsed = safeParseJSON(raw);
+      if (ok && typeof content === "string" && content.trim()) {
+        // assistant의 content(우리가 강제한 JSON 문자열)를 파싱
+        const parsed = safeParseJSON(content);
         const translated = parsed?.translated?.toString()?.trim() || "";
         const literal = parsed?.literal?.toString()?.trim() || "";
 
@@ -209,13 +220,12 @@ export default async function handler(req, res) {
             outTexts.push(`(직역) ${literal}`);
           }
         } else {
-          // 파싱 실패/빈 결과 → 단문 대체
-          outTexts = ["번역에 실패했어요. 다시 시도해 주세요."];
+          outTexts = ["번역 형식 파싱에 실패했어요. 다시 한 번 보내주세요."];
         }
       } else {
         // 401/429/timeout 등 실패 시 단문 대체
         outTexts = ["번역에 실패했어요. 다시 시도해 주세요."];
-        console.error("OpenAI error:", status, raw);
+        console.error("OpenAI error:", status, errorRaw);
       }
 
       await lineReply(replyToken, outTexts);
@@ -224,7 +234,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ ok: true });
   } catch (e) {
     console.error("Webhook error:", e);
-    // 아주 마지막 안전망: 실패해도 200으로 끝내되, 라인에는 최소 1줄 보냄(위에서 이미 보냄)
     return res.status(200).json({ ok: false });
   }
 }
