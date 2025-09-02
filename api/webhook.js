@@ -4,14 +4,18 @@ import fetch from "node-fetch";
  * 요구사항 (최종)
  * - 오직 번역만 (잡담/설명 금지)
  * - 항상 "친근한 존댓말"로 번역
- *   • KR→TH: 태국어는 남성 공손체(ครับ) 톤 (자연스러울 때 사용, 과도하게 강요 X), "깨우"→"แก้ว", 한글 금지
- *   • TH→KR: 한국어는 ~요/~해요 톤(남성, 친근 존댓말)
+ *   • KR→TH: 태국어는 남성 공손체 톤(자연스러울 때 ครับ 사용), "깨우"→"แก้ว", 한글 금지
+ *   • TH→KR: 한국어는 남성 친근 존댓말(~요/~해요)
  * - 한국어 입력 시: ①태국어 ②(직역) 한국어 2줄
  * - 태국어 입력 시: 한국어 1줄
  * - ㅋㅋ/ㅎㅎ/하하 ↔ 555/ฮ่าๆ
  * - JSON 강제 + 폴백
- * - 'ครับ' 자동 강제 덧붙이기 없음 (모델이 자연스럽게 사용)
+ * - 'ครับ' 자동 강제 덧붙이기 없음 (모델 판단)
  */
+
+// 환경변수로 모델/옵션 제어
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-5";   // ← 기본 gpt-5
+const BACKLITERAL = process.env.BACKLITERAL !== "off";       // 직역 줄 on/off (기본 on)
 
 const SYSTEM_PROMPT = `
 You are a STRICT translation engine for a Korean man and his Thai girlfriend on LINE.
@@ -19,17 +23,17 @@ You are a STRICT translation engine for a Korean man and his Thai girlfriend on 
 You MUST NEVER chat, greet, add commentary, or explain. ONLY translate as instructed.
 
 Global style (apply ALWAYS):
-- The output must be in a friendly, polite style.
-- Thai outputs should read as a friendly male polite tone (e.g., using "ครับ" when natural), not overly stiff.
-- Korean outputs should read as a friendly male polite tone (~요/~해요 register).
+- Output must be natural, smooth, and idiomatic while preserving meaning.
+- Thai outputs: friendly male polite tone (use "ครับ" naturally when appropriate; not overly stiff).
+- Korean outputs: friendly male polite tone (~요/~해요), not awkward or literal-sounding.
 
 Conversion rules:
 - Korean → Thai (KR→TH):
-  • Output THAI ONLY (NO Hangul). Keep a friendly male polite tone (use "ครับ" naturally when appropriate).
-  • If the Korean input contains the name "깨우", ALWAYS translate it as "แก้ว".
-  • ALSO provide a literal back-translation of your THAI output into Korean, in friendly polite style as well.
+  • Output THAI ONLY (NO Hangul).
+  • If input contains "깨우", ALWAYS translate that name as "แก้ว".
+  • ALSO provide a literal back-translation of your THAI output into Korean, in friendly polite style.
 - Thai → Korean (TH→KR):
-  • Output natural Korean in friendly polite male tone (~요/~해요).
+  • Output natural Korean in friendly male polite tone (~요/~해요).
 
 Laughter mapping:
 - ㅋㅋ / ㅎㅎ / 하하 ↔ 555 / ฮ่าๆ
@@ -68,13 +72,13 @@ export default async function handler(req, res) {
 
       const userText = (ev.message.text || "").trim();
 
-      // 1) JSON 강제 호출
+      // 1) JSON 강제 호출 (GPT-5)
       const jsonResp = await fetch("https://api.openai.com/v1/chat/completions", {
         method: "POST",
         headers: REQ_HEADERS(OPENAI_API_KEY),
         body: JSON.stringify({
-          model: "gpt-4o-mini",
-          temperature: 0.3,
+          model: OPENAI_MODEL,
+          temperature: 0.5, // 자연스러움 소폭↑
           messages: [
             { role: "system", content: SYSTEM_PROMPT.trim() },
             { role: "user", content: userText },
@@ -88,12 +92,12 @@ export default async function handler(req, res) {
       let messages = [];
 
       if (data && data.mode === "KR→TH" && typeof data.th === "string") {
-        // KR→TH: 1) 태국어, 2) (직역) 한국어
+        // KR→TH: 1) 태국어, 2) (직역) 한국어(옵션)
         const thClean = enforceThaiRules(data.th, userText).slice(0, MAX_LEN);
         messages.push({ type: "text", text: thClean });
 
         const back = (data.ko_backliteral || "").trim();
-        if (back) messages.push({ type: "text", text: `(직역) ${back.slice(0, MAX_LEN)}` });
+        if (BACKLITERAL && back) messages.push({ type: "text", text: `(직역) ${back.slice(0, MAX_LEN)}` });
 
       } else if (data && data.mode === "TH→KR" && typeof data.ko === "string") {
         // TH→KR: 한국어 1줄
@@ -128,15 +132,15 @@ async function fallbackTranslate(text, OPENAI_API_KEY) {
   const isKR = hasHangul(text);
 
   const sys = isKR
-    ? `You output EXACTLY two lines:\n1) THAI ONLY (no Hangul; friendly male polite tone when natural; map ㅋㅋ/ㅎㅎ/하하→555/ฮ่าๆ; replace "깨우"→"แก้ว")\n2) "(직역) " + literal Korean back-translation of line 1 in friendly polite tone. No other text.`
+    ? `You output EXACTLY two lines:\n1) THAI ONLY (no Hangul; friendly male polite tone; map ㅋㅋ/ㅎㅎ/하하→555/ฮ่าๆ; replace "깨우"→"แก้ว")\n2) "(직역) " + literal Korean back-translation of line 1 in friendly polite tone. No other text.`
     : `Translate Thai to Korean in a friendly male polite tone (~요/~해요). Output EXACTLY one line. Map 555/ฮ่าๆ→ㅋㅋ/ㅎㅎ/하하. No extra text.`;
 
   const r = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: REQ_HEADERS(OPENAI_API_KEY),
     body: JSON.stringify({
-      model: "gpt-4o-mini",
-      temperature: 0.3,
+      model: OPENAI_MODEL,
+      temperature: 0.5,
       messages: [
         { role: "system", content: sys },
         { role: "user", content: text },
@@ -152,8 +156,10 @@ async function fallbackTranslate(text, OPENAI_API_KEY) {
     // 1줄: 태국어 (한글 제거 보정)
     const th = enforceThaiRules(line1 || "", text).slice(0, MAX_LEN);
     const msgs = [{ type: "text", text: th }];
-    // 2줄: (직역) 한국어
-    if (line2) msgs.push({ type: "text", text: line2.startsWith("(직역)") ? line2.slice(0, MAX_LEN) : `(직역) ${line2}`.slice(0, MAX_LEN) });
+    // 2줄: (직역) 한국어 (옵션)
+    if (BACKLITERAL && line2) {
+      msgs.push({ type: "text", text: line2.startsWith("(직역)") ? line2.slice(0, MAX_LEN) : `(직역) ${line2}`.slice(0, MAX_LEN) });
+    }
     return msgs;
   } else {
     return [{ type: "text", text: out.slice(0, MAX_LEN) }];
@@ -165,12 +171,12 @@ async function fallbackTranslate(text, OPENAI_API_KEY) {
  * - "깨우"가 원문에 있으면 반드시 "แก้ว" 포함
  * - 태국어 줄에 한글 섞이면 제거
  * - 웃음 보정
- * - 'ครับ'는 자동으로 강제 추가하지 않음(자연스럽게 사용)
+ * - 'ครับ'는 자동 강제하지 않음(모델 판단)
  */
 function enforceThaiRules(thaiOut = "", originalKR = "") {
   let s = thaiOut;
 
-  // 깨우 → แก้ว
+  // 깨우 → แก้ว (혹시 다른 표기 치환)
   if (originalKR.includes("깨우") && !s.includes("แก้ว")) {
     s = s.replace(/เกอู|แกอู|Kaeu|Kaeo|Gaeu|Gaeo/gi, "แก้ว");
     if (!s.includes("แก้ว")) s = "แก้ว " + s;
