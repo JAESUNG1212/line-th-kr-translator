@@ -1,145 +1,198 @@
+// api/webhook.js
 import fetch from "node-fetch";
 
 /**
- * 견고한 안전모드 + 모델 폴백
- * - JSON 파싱 제거 (텍스트만 받기)
- * - gpt-4o(또는 OPENAI_MODEL) → 실패 시 gpt-4o-mini 자동 폴백
- * - 디버그 로그 강화 (DEBUG=1 설정 시)
- * - KR→TH: 1줄 태국어(남성 존댓말, “깨우”→“แก้ว”), 다음줄에 한국어 직역
- * - TH→KR: 한국어 1줄 (친근한 존댓말 ~요/~해요)
- * - ㅋㅋ/ㅎㅎ ↔ 555/ฮ่าๆ 보정 (설명문 금지)
+ * 요구사항 요약
+ * - 오직 번역만 (설명/잡담 X)
+ * - 한국↔태국 상호 번역, 남성 존댓말(요/합니다) & 태국어는 남성 공손체(ครับ)
+ * - 한국어 입력: 태국어 1줄 + (다음줄) 한국어 직역 미리보기
+ * - 태국어 입력: 한국어 1줄 + (다음줄) 태국어 직역 미리보기
+ * - ㅋㅋ/ㅎㅎ/555/ลืม 등 특수한 표현은 자연스럽게 변환
+ * - JSON으로만 응답(스키마 강제), 파싱 실패 시 자동 재시도 → mini로 폴백
  */
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";     // 주 모델
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
-const DEBUG = process.env.DEBUG === "1";
+const LINE_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
-const SYSTEM_PROMPT = `
-You are a STRICT translation engine for a Korean man and his Thai girlfriend on LINE.
+const LINE_API = "https://api.line.me/v2/bot/message/reply";
+const OAI_URL   = "https://api.openai.com/v1/responses";
 
-RULES:
-- OUTPUT MUST BE ONLY THE FINAL TRANSLATION TEXT. 
-- DO NOT add explanations, markdown, code fences, JSON, or any extra text.
-- If the input is Korean:
-  1) Replace the name "깨우" with "แก้ว".
-  2) Translate to Thai, male polite tone (end with "ครับ").
-  3) First line: Thai translation only.
-  4) Second line: literal Korean back-translation in parentheses like (…).
-- If the input is Thai:
-  - Translate to Korean (friendly polite form ~요/~해요), single line only.
-- Normalize laughter:
-  - ㅋㅋ/ㅎㅎ -> 555/ฮ่าๆ in Thai
-  - 555/ฮ่าๆ -> ㅋㅋ/ㅎㅎ in Korean
-- AGAIN: Output ONLY the final lines as described. No extra words.
-`;
+// ---------- 유틸 ----------
+const jsonHeaders = {
+  "Content-Type": "application/json",
+  Authorization: `Bearer ${OPENAI_API_KEY}`,
+};
 
-function cleanText(s) {
-  if (!s) return "";
-  // 코드펜스/마크다운 제거
-  s = s.replace(/```[\s\S]*?```/g, (block) =>
-    block.replace(/```[a-zA-Z]*\n?/, "").replace(/```$/, "")
-  );
-  // 흔한 불필요 머리말 제거 시도
-  s = s.replace(/^(?:\s*Output\s*:|\s*Result\s*:|\s*Translation\s*:)\s*/i, "");
-  return s.trim();
-}
-
-async function callOpenAI(model, userText) {
-  const body = {
-    model,
-    messages: [
-      { role: "system", content: SYSTEM_PROMPT },
-      { role: "user", content: userText },
-    ],
-    temperature: 0.2,
-    max_tokens: 500,
-  };
-
-  const r = await fetch("https://api.openai.com/v1/chat/completions", {
+function replyMessage(replyToken, text) {
+  return fetch(LINE_API, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${OPENAI_API_KEY}`,
+      Authorization: `Bearer ${LINE_TOKEN}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify({
+      replyToken,
+      messages: [{ type: "text", text }],
+    }),
   });
-
-  let json;
-  try {
-    json = await r.json();
-  } catch (e) {
-    if (DEBUG) console.log("OpenAI JSON parse error:", e);
-    return { ok: false, reason: "json_parse_error", text: "" };
-  }
-
-  if (DEBUG) {
-    console.log("=== OpenAI status:", r.status, r.statusText);
-    console.log("=== OpenAI raw:", JSON.stringify(json, null, 2).slice(0, 4000));
-  }
-
-  if (!r.ok) {
-    const reason = json?.error?.message || r.statusText || "openai_error";
-    return { ok: false, reason, text: "" };
-  }
-
-  const raw = json?.choices?.[0]?.message?.content || "";
-  const text = cleanText(raw);
-  if (!text) return { ok: false, reason: "empty_content", text: "" };
-
-  // 설명문 들어간 흔적 있으면 제거 재시도
-  if (text.includes("```")) {
-    const cleaned = cleanText(text);
-    if (cleaned) return { ok: true, reason: "ok", text: cleaned };
-  }
-
-  return { ok: true, reason: "ok", text };
 }
 
+function isThai(txt) {
+  return /[\u0E00-\u0E7F]/.test(txt);
+}
+
+function buildSystemPrompt() {
+  return `
+You are a STRICT translation engine between Korean and Thai for LINE chat.
+RULES:
+- OUTPUT ONLY JSON that matches the provided JSON Schema. No extra text.
+- If input is Korean ➜ produce Thai (male polite tone using "ครับ") as "primary",
+  and put a literal Korean back-translation preview in "preview".
+- If input is Thai ➜ produce Korean (male polite 존댓말) as "primary",
+  and put Thai literal back-translation preview in "preview".
+- Be concise; one sentence per field.
+- Never include any explanations, notes, or extra keys.
+- No code fences. No markdown. Only JSON.
+`;
+}
+
+const RESPONSE_FORMAT = {
+  type: "json_schema",
+  json_schema: {
+    name: "translation_payload",
+    schema: {
+      type: "object",
+      properties: {
+        primary: { type: "string" }, // 최종 번역문
+        preview: { type: "string" }, // 원문 언어로의 직역 미리보기
+      },
+      required: ["primary", "preview"],
+      additionalProperties: false,
+    },
+    strict: true,
+  },
+};
+
+async function callOpenAI(model, userText, direction) {
+  const content = [
+    { role: "system", content: buildSystemPrompt() },
+    {
+      role: "user",
+      content:
+        `Input language: ${direction === "KR->TH" ? "Korean" : "Thai"}\n` +
+        `Output target: ${direction === "KR->TH" ? "Thai (male polite 'ครับ')" : "Korean (남성 공손 존댓말)"}\n` +
+        `Text: """${userText}"""`,
+    },
+  ];
+
+  const res = await fetch(OAI_URL, {
+    method: "POST",
+    headers: jsonHeaders,
+    body: JSON.stringify({
+      model,
+      input: content,
+      temperature: 0.2,
+      max_output_tokens: 350,
+      response_format: RESPONSE_FORMAT, // ★ JSON 스키마 강제
+    }),
+  });
+
+  if (!res.ok) {
+    const errText = await res.text().catch(() => "");
+    throw new Error(`OpenAI HTTP ${res.status} ${errText}`);
+  }
+
+  const data = await res.json();
+
+  // responses API: data.output[0].content[0].text
+  const text =
+    data?.output?.[0]?.content?.[0]?.text ??
+    data?.output_text ??
+    data?.choices?.[0]?.message?.content ??
+    "";
+
+  if (!text) throw new Error("Empty OpenAI response");
+
+  // 견고한 파서: JSON 스키마 강제지만, 혹시나 깨지면 복구 시도
+  try {
+    return JSON.parse(text);
+  } catch {
+    // 가장 바깥 {}만 추출하여 재시도
+    const m = text.match(/\{[\s\S]*\}$/);
+    if (m) {
+      try {
+        return JSON.parse(m[0]);
+      } catch {
+        /* no-op */
+      }
+    }
+    throw new Error("JSON parse failed");
+  }
+}
+
+async function translate(userText) {
+  const direction = isThai(userText) ? "TH->KR" : "KR->TH";
+
+  // 1차: 지정 모델(예: gpt-4o)
+  try {
+    const r = await callOpenAI(OPENAI_MODEL, userText, direction);
+    if (typeof r?.primary === "string" && typeof r?.preview === "string") {
+      return r;
+    }
+    throw new Error("schema mismatch");
+  } catch (e) {
+    // 2차: mini 폴백
+    try {
+      const r2 = await callOpenAI("gpt-4o-mini", userText, direction);
+      if (typeof r2?.primary === "string" && typeof r2?.preview === "string") {
+        return r2;
+      }
+      throw new Error("fallback schema mismatch");
+    } catch (e2) {
+      // 마지막: 그냥 원문 반환
+      return { primary: "[번역 실패] " + userText, preview: "" };
+    }
+  }
+}
+
+// ---------- LINE Webhook ----------
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).send("Method Not Allowed");
+  if (req.method !== "POST") {
+    res.status(405).json({ ok: false });
+    return;
+  }
 
   try {
-    const events = req.body.events || [];
-    for (const event of events) {
-      if (event.type !== "message" || event.message.type !== "text") continue;
-
-      const userMsg = (event.message.text || "").trim();
-      if (DEBUG) console.log("User says:", userMsg);
-
-      // 1차: 설정된 모델(기본 gpt-4o)
-      let ai = await callOpenAI(OPENAI_MODEL, userMsg);
-
-      // 4o/5가 막혔거나 쿼터 문제일 수 있음 → 2차 폴백: gpt-4o-mini
-      if (!ai.ok) {
-        if (DEBUG) console.log("Primary model failed:", ai.reason);
-        if (OPENAI_MODEL !== "gpt-4o-mini") {
-          const fallback = await callOpenAI("gpt-4o-mini", userMsg);
-          if (fallback.ok) ai = fallback;
-          else if (DEBUG) console.log("Fallback mini failed:", fallback.reason);
-        }
-      }
-
-      let replyText =
-        ai.ok && ai.text ? ai.text : "번역에 실패했어요. 다시 시도해 주세요.";
-
-      // LINE Reply
-      await fetch("https://api.line.me/v2/bot/message/reply", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-        },
-        body: JSON.stringify({
-          replyToken: event.replyToken,
-          messages: [{ type: "text", text: replyText }],
-        }),
-      });
+    const { events } = req.body || {};
+    if (!Array.isArray(events)) {
+      res.status(200).json({ ok: true });
+      return;
     }
 
-    res.status(200).send("OK");
-  } catch (e) {
-    console.error("Handler error:", e);
-    res.status(500).send("Internal Server Error");
+    for (const ev of events) {
+      if (ev.type !== "message" || ev.message?.type !== "text") continue;
+      const text = (ev.message?.text || "").trim();
+      if (!text) continue;
+
+      // 번역
+      const out = await translate(text);
+      const final = out.preview
+        ? `${out.primary}\n\n— 미리보기: ${out.preview}`
+        : out.primary;
+
+      await replyMessage(ev.replyToken, final);
+    }
+
+    res.status(200).json({ ok: true });
+  } catch (err) {
+    // 안전망
+    try {
+      const ev = req.body?.events?.[0];
+      if (ev?.replyToken) {
+        await replyMessage(ev.replyToken, "번역 형식 오류가 발생했어요. 다시 시도해 주세요.");
+      }
+    } catch {}
+    res.status(200).json({ ok: true });
   }
 }
