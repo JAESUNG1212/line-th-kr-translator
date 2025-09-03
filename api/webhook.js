@@ -2,32 +2,40 @@ import fetch from "node-fetch";
 
 /**
  * 요구사항 (최종)
- * - 오직 번역만 (설명/잡담 금지)
+ * - 오직 번역만 (설명/잡담 X)
  * - 항상 "친근한 존댓말"로 번역
- * - KR→TH: 태국어는 남성 친근 존댓말 (~ครับ 사용), "깨우" → "แก้ว"
- * - TH→KR: 한국어는 남성 친근 존댓말 (~요/~해요)
- * - 한국어 입력 시: 태국어 1줄 + GPT가 번역한 태국어를 다시 한국어 직역 1줄
+ * - KR→TH: 태국어는 남성 존댓말 톤(~ครับ 사용), "깨우" → "แก้ว", 한글 금지
+ * - TH→KR: 한국어는 남성 친근 존댓말(~요/~해요)
+ * - 한국어 입력 시: 태국어 1줄 + (GPT가 번역한 태국어를 한국어 직역 1줄)
  * - 태국어 입력 시: 한국어 1줄
- * - ㅋㅋㅋ/ㅎㅎ → 555/ฮ่าๆ 변환
- * - JSON 강제 출력 ( {"text":"..."} 형식만 )
+ * - ㅋㅋ/ㅎㅎ = 555/ฮ่าๆ 변환
+ * - JSON 강제 출력 {"text":"..."} (그 외 텍스트 금지)
  */
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
 const SYSTEM_PROMPT = `
 You are a STRICT translation engine for a Korean man and his Thai girlfriend on LINE.
 
-Rules:
-- Always translate only, no explanation, no commentary.
-- KR→TH: Translate Korean into Thai (male speaker, polite/friendly tone ending with ครับ). 
-- Replace "깨우" with "แก้ว".
-- After the Thai line, add a second line in Korean explaining what you sent in Thai (literal back-translation).
-- TH→KR: Translate Thai into Korean (male speaker, polite/friendly tone, ending ~요/~해요).
-- Convert "ㅋㅋㅋ" or "ㅎㅎ" to "555" or "ฮ่าๆ".
-- Output must ALWAYS be valid JSON in the format:
-{"text":"...translation..."}
+RULES:
+1. Output ONLY valid JSON in the format: {"text":"..."}.
+2. No explanations, no commentary, no markdown.
+3. Korean → Thai:
+   - Translate into Thai using male polite tone (~ครับ).
+   - Replace "깨우" with "แก้ว".
+   - After Thai line, add one more line with Korean literal back-translation.
+   - Example:
+     {"text":"สวัสดีครับ\\n(안녕하세요)"}
+4. Thai → Korean:
+   - Translate into friendly polite Korean (~요/~해요).
+   - Example:
+     {"text":"밥 먹었어요?"}
+5. Laughter:
+   - ㅋㅋㅋ/ㅎㅎㅎ → 555/ฮ่าๆ
+   - 555/ฮ่าๆ → ㅋㅋㅋ/ㅎㅎㅎ
+6. ABSOLUTELY no text outside JSON.
 `;
 
 export default async function handler(req, res) {
@@ -35,10 +43,9 @@ export default async function handler(req, res) {
     return res.status(405).send("Method Not Allowed");
   }
 
-  const body = req.body;
-
   try {
-    for (const event of body.events) {
+    const events = req.body.events;
+    for (const event of events) {
       if (event.type === "message" && event.message.type === "text") {
         const userMessage = event.message.text;
 
@@ -55,28 +62,27 @@ export default async function handler(req, res) {
               { role: "system", content: SYSTEM_PROMPT },
               { role: "user", content: userMessage },
             ],
-            temperature: 0.2,
+            temperature: 0.3,
           }),
         });
 
         const data = await response.json();
 
-        let translatedText = "번역에 실패했어요. 다시 시도해주세요.";
+        // OpenAI 응답 파싱 보정
+        let raw = data.choices?.[0]?.message?.content?.trim() || "";
+        let translatedText = "번역 형식 오류가 발생했어요.";
 
-        if (data.choices && data.choices.length > 0) {
-          try {
-            // GPT 응답을 JSON으로 파싱
-            const parsed = JSON.parse(data.choices[0].message.content);
-            translatedText = parsed.text;
-          } catch (err) {
-            console.error("파싱 오류:", err, data.choices[0].message.content);
-            translatedText = "번역 형식 파싱에 실패했어요. 다시 보내주세요.";
+        try {
+          // JSON 부분만 정규식으로 추출
+          const match = raw.match(/{\s*"text"\s*:\s*".*"\s*}/s);
+          if (match) {
+            translatedText = JSON.parse(match[0]).text;
           }
-        } else {
-          console.error("OpenAI 응답 오류:", data);
+        } catch (e) {
+          console.error("JSON parse error:", e, raw);
         }
 
-        // LINE Reply API 호출
+        // LINE Reply API
         await fetch("https://api.line.me/v2/bot/message/reply", {
           method: "POST",
           headers: {
@@ -93,7 +99,7 @@ export default async function handler(req, res) {
 
     res.status(200).send("OK");
   } catch (error) {
-    console.error("에러 발생:", error);
+    console.error("Error:", error);
     res.status(500).send("Internal Server Error");
   }
 }
