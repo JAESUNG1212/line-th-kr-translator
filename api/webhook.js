@@ -2,100 +2,121 @@ import fetch from "node-fetch";
 
 /**
  * 요구사항 (최종)
- * - 오직 번역만 (잡담/설명 금지)
+ * - 오직 번역만 (설명/잡담 X)
  * - 항상 "친근한 존댓말"로 번역
- * - KR→TH: 태국어는 남성 친근 존댓말 톤(~ครับ), "깨우"→"แก้ว", 한글 금지
- * - TH→KR: 한국어는 남성 친근 존댓말 (~요/~해요)
- * - 한국어 입력 시: 태국어 + 직역 한국어 2줄
+ * - KR→TH: 태국어는 남성 존댓말 톤(~ครับ 사용), "깨우" → "แก้ว"
+ * - TH→KR: 한국어는 남성 친근 존댓말(~요/해요)
+ * - 한국어 입력 시: 태국어 1줄 + (GPT가 번역한 태국어를 다시 한국어로 직역한 1줄)
  * - 태국어 입력 시: 한국어 1줄
- * - ㅋㅋ/ㅎㅎ → 555/ฮ่าๆ
- * - JSON 강제 출력
- * - "ครับ" 자동 강제 덧붙이지 않고 모델이 판단
+ * - ㅋㅋ/ㅎㅎ → 555/ฮ่าๆ 변환
+ * - JSON 강제 X (일반 텍스트 출력)
  */
 
-// 환경변수로 모델/옵션 제어
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";  // ✅ 기본 gpt-4o
-const BACKLITERAL = process.env.BACKLITERAL !== "off";       // 직역 줄 on/off (기본 on)
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
 
 const SYSTEM_PROMPT = `
 You are a STRICT translation engine for a Korean man and his Thai girlfriend on LINE.
 
-RULES:
-1. Only translate. No explanations, no commentary.
-2. Always output in JSON: { "result": "...translated text..." }
-3. If input is Korean → output must be Thai translation (male, polite, friendly tone ~ครับ) 
-   + if BACKLITERAL is on, also append Korean literal back-translation line.
-   Format: "<Thai translation>\\n<literal Korean back-translation>"
-4. If input is Thai → output must be Korean translation (male, polite, friendly tone ~요/~해요).
-5. Replace "깨우" with "แก้ว".
-6. Never include Hangul in Thai output.
-7. Laughter: "ㅋㅋㅋ","ㅎㅎ" → "555" or "ฮ่าๆๆ".
-8. Absolutely no additional text besides the translation.
+Rules:
+1. If input is Korean:
+   - Translate to Thai in friendly polite male tone ("ครับ").
+   - Replace "깨우" with "แก้ว".
+   - Always output two lines:
+     ① Thai translation only
+     ② Korean back-translation of the Thai line (so user can see exactly how GPT translated it).
+   - Do NOT mix Hangul in the Thai line.
+
+2. If input is Thai:
+   - Translate to Korean in friendly polite male tone (~요/~해요).
+   - Output only one Korean line.
+
+3. Always keep style natural, smooth, affectionate, and concise.
+4. Replace 웃음 표현: "ㅋㅋ", "ㅎㅎ", "하하" → "555" or "ฮ่าๆๆ" in Thai.
 `;
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
+  if (req.method === "POST") {
+    try {
+      const events = req.body.events;
+      if (!events || events.length === 0) {
+        return res.status(200).send("No events");
+      }
 
-  try {
-    const body = req.body;
+      for (const event of events) {
+        if (event.type === "message" && event.message.type === "text") {
+          const userText = event.message.text;
 
-    // LINE webhook 이벤트 처리
-    if (body.events && body.events.length > 0) {
-      const event = body.events[0];
-
-      if (event.type === "message" && event.message.type === "text") {
-        const userMessage = event.message.text;
-
-        // OpenAI 번역 요청
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
+          const payload = {
             model: OPENAI_MODEL,
             messages: [
               { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: userMessage },
+              { role: "user", content: userText },
             ],
-            temperature: 0.3,
-          }),
-        });
+            temperature: 0.2,
+          };
 
-        const data = await response.json();
+          const response = await fetch("https://api.openai.com/v1/chat/completions", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${OPENAI_API_KEY}`,
+            },
+            body: JSON.stringify(payload),
+          });
 
-        let replyText = "번역에 실패했어요. 다시 시도해주세요.";
-        if (data.choices && data.choices.length > 0) {
-          try {
-            const content = data.choices[0].message.content.trim();
-            const json = JSON.parse(content);
-            replyText = json.result;
-          } catch (err) {
-            replyText = "번역 형식 파싱에 실패했어요. 다시 보내주세요.";
+          const result = await response.json();
+
+          if (!response.ok || !result.choices) {
+            console.error("OpenAI API Error:", result);
+            await replyMessage(event.replyToken, "번역에 실패했어요. 다시 시도해주세요.");
+            continue;
           }
+
+          const translated = result.choices[0].message?.content?.trim();
+          if (!translated) {
+            await replyMessage(event.replyToken, "번역 결과가 비어있어요.");
+            continue;
+          }
+
+          await replyMessage(event.replyToken, translated);
         }
-
-        // LINE Reply API 호출
-        await fetch("https://api.line.me/v2/bot/message/reply", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${process.env.LINE_CHANNEL_ACCESS_TOKEN}`,
-          },
-          body: JSON.stringify({
-            replyToken: event.replyToken,
-            messages: [{ type: "text", text: replyText }],
-          }),
-        });
       }
-    }
 
-    res.status(200).json({ ok: true });
-  } catch (error) {
-    console.error("Error:", error);
-    res.status(500).json({ error: "Internal Server Error" });
+      return res.status(200).send("OK");
+    } catch (err) {
+      console.error("Handler Error:", err);
+      return res.status(500).send("Internal Server Error");
+    }
+  } else {
+    res.setHeader("Allow", ["POST"]);
+    return res.status(405).end(`Method ${req.method} Not Allowed`);
+  }
+}
+
+// LINE Reply API
+async function replyMessage(replyToken, text) {
+  const url = "https://api.line.me/v2/bot/message/reply";
+  const body = {
+    replyToken: replyToken,
+    messages: [{ type: "text", text }],
+  };
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+      },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      console.error("LINE API Error:", await response.text());
+    }
+  } catch (err) {
+    console.error("Reply Error:", err);
   }
 }
