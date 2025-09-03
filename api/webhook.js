@@ -1,42 +1,86 @@
 import fetch from "node-fetch";
 
 /**
- * 요구사항 (최종)
- * - 오직 번역만 (설명/잡담 X)
- * - 항상 "친근한 존댓말"로 번역
- * - KR→TH: 태국어는 남성 존댓말 톤(~ครับ 사용), "깨우" → "แก้ว", 한글 금지
- * - TH→KR: 한국어는 남성 친근 존댓말(~요/~해요)
- * - 한국어 입력 시: 태국어 1줄 + (GPT가 번역한 태국어를 한국어 직역 1줄)
- * - 태국어 입력 시: 한국어 1줄
- * - ㅋㅋ/ㅎㅎ = 555/ฮ่าๆ 변환
- * - JSON 강제 출력 {"text":"..."} (그 외 텍스트 금지)
+ * 요구사항 요약
+ * - 오직 번역만 (설명/잡담 금지)
+ * - KR→TH: 남성 존댓말(~ครับ), "깨우"→"แก้ว", 첫 줄 태국어 / 두 번째 줄 한국어 직역
+ * - TH→KR: 한국어 남성 친근 존댓말(~요/~해요)
+ * - ㅋㅋ/ㅎㅎ ↔ 555/ฮ่าๆ 보정
+ * - 결과는 무조건 {"text":"..."} 한 덩어리 JSON만
  */
 
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
+const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o";
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const LINE_CHANNEL_ACCESS_TOKEN = process.env.LINE_CHANNEL_ACCESS_TOKEN;
+
+// 디버그용(원하면 Vercel 환경변수에 DEBUG=1 추가)
+const DEBUG = process.env.DEBUG === "1";
 
 const SYSTEM_PROMPT = `
 You are a STRICT translation engine for a Korean man and his Thai girlfriend on LINE.
 
-RULES:
-1. Output ONLY valid JSON in the format: {"text":"..."}.
-2. No explanations, no commentary, no markdown.
-3. Korean → Thai:
-   - Translate into Thai using male polite tone (~ครับ).
-   - Replace "깨우" with "แก้ว".
-   - After Thai line, add one more line with Korean literal back-translation.
-   - Example:
-     {"text":"สวัสดีครับ\\n(안녕하세요)"}
-4. Thai → Korean:
-   - Translate into friendly polite Korean (~요/~해요).
-   - Example:
-     {"text":"밥 먹었어요?"}
-5. Laughter:
-   - ㅋㅋㅋ/ㅎㅎㅎ → 555/ฮ่าๆ
-   - 555/ฮ่าๆ → ㅋㅋㅋ/ㅎㅎㅎ
-6. ABSOLUTELY no text outside JSON.
+OUTPUT FORMAT (MANDATORY):
+- You MUST output ONLY a single valid JSON object: {"text":"..."} (no markdown, no explanations).
+- Never wrap with code fences. No extra text.
+- If Korean → Thai:
+  1) Replace "깨우" with "แก้ว".
+  2) Translate Korean to Thai (male polite tone, end with "ครับ").
+  3) Then add a second line (same message) as a Korean literal back-translation.
+  Example: {"text":"สวัสดีครับ\\n(안녕하세요)"}
+- If Thai → Korean:
+  - Translate into friendly/polite Korean (~요/~해요) and output in one line.
+- Normalize laughter:
+  - ㅋㅋㅋ/ㅎㅎㅎ → 555/ฮ่าๆ in Thai
+  - 555/ฮ่าๆ → ㅋㅋㅋ/ㅎㅎㅎ in Korean
+- ABSOLUTELY NO TEXT OUTSIDE JSON.
 `;
+
+/** OpenAI 응답에서 {"text":"..."}만 최대한 안전하게 뽑아내기 */
+function extractTextStrict(raw) {
+  if (!raw) return null;
+
+  // 1) 코드펜스 제거 (```json ... ``` 등)
+  raw = raw.replace(/```[\s\S]*?```/g, (block) => {
+    // 코드펜스 안쪽에 JSON이 있으면 꺼냄
+    const m = block.match(/{[\s\S]*}/);
+    return m ? m[0] : "";
+  }).trim();
+
+  // 2) 그대로 파싱 시도
+  try {
+    const obj = JSON.parse(raw);
+    if (obj && typeof obj.text === "string") {
+      return obj.text;
+    }
+  } catch (_) {}
+
+  // 3) 문서 내 첫 { 와 마지막 } 범위 추출 후 파싱
+  const first = raw.indexOf("{");
+  const last = raw.lastIndexOf("}");
+  if (first !== -1 && last !== -1 && last > first) {
+    const slice = raw.slice(first, last + 1);
+    try {
+      const obj = JSON.parse(slice);
+      if (obj && typeof obj.text === "string") {
+        return obj.text;
+      }
+    } catch (_) {}
+  }
+
+  // 4) "text":"..."" 패턴만이라도 잡기 (따옴표/개행 포함 넉넉히)
+  const m = raw.match(/"text"\s*:\s*"([\s\S]*?)"/);
+  if (m && m[1] != null) {
+    // JSON 문자열 언이스케이프
+    let s = m[1];
+    s = s.replace(/\\"/g, '"')
+         .replace(/\\\\/g, "\\")
+         .replace(/\\n/g, "\n")
+         .replace(/\\t/g, "\t");
+    return s;
+  }
+
+  return null;
+}
 
 export default async function handler(req, res) {
   if (req.method !== "POST") {
@@ -44,62 +88,66 @@ export default async function handler(req, res) {
   }
 
   try {
-    const events = req.body.events;
+    const events = req.body.events || [];
     for (const event of events) {
-      if (event.type === "message" && event.message.type === "text") {
-        const userMessage = event.message.text;
+      if (event.type !== "message" || event.message.type !== "text") continue;
 
-        // OpenAI API 호출
-        const response = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${OPENAI_API_KEY}`,
-          },
-          body: JSON.stringify({
-            model: OPENAI_MODEL,
-            messages: [
-              { role: "system", content: SYSTEM_PROMPT },
-              { role: "user", content: userMessage },
-            ],
-            temperature: 0.3,
-          }),
-        });
+      const userMessage = event.message.text;
 
-        const data = await response.json();
+      // OpenAI 호출
+      const payload = {
+        model: OPENAI_MODEL,
+        messages: [
+          { role: "system", content: SYSTEM_PROMPT },
+          { role: "user", content: userMessage },
+        ],
+        temperature: 0.2,
+        // JSON 모드(지원 모델에서 강제 구조화)
+        response_format: { type: "json_object" },
+        max_tokens: 500,
+      };
 
-        // OpenAI 응답 파싱 보정
-        let raw = data.choices?.[0]?.message?.content?.trim() || "";
-        let translatedText = "번역 형식 오류가 발생했어요.";
+      const aiResp = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify(payload),
+      });
 
-        try {
-          // JSON 부분만 정규식으로 추출
-          const match = raw.match(/{\s*"text"\s*:\s*".*"\s*}/s);
-          if (match) {
-            translatedText = JSON.parse(match[0]).text;
-          }
-        } catch (e) {
-          console.error("JSON parse error:", e, raw);
-        }
+      const data = await aiResp.json();
 
-        // LINE Reply API
-        await fetch("https://api.line.me/v2/bot/message/reply", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
-          },
-          body: JSON.stringify({
-            replyToken: event.replyToken,
-            messages: [{ type: "text", text: translatedText }],
-          }),
-        });
+      if (DEBUG) {
+        console.log("=== OpenAI raw ===");
+        console.log(JSON.stringify(data, null, 2));
       }
+
+      let raw = data?.choices?.[0]?.message?.content?.trim() || "";
+      let translatedText = extractTextStrict(raw);
+
+      if (!translatedText) {
+        if (DEBUG) console.log("Parse failed raw:", raw);
+        translatedText = "번역 형식 오류가 발생했어요.";
+      }
+
+      // LINE Reply
+      await fetch("https://api.line.me/v2/bot/message/reply", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        },
+        body: JSON.stringify({
+          replyToken: event.replyToken,
+          messages: [{ type: "text", text: translatedText }],
+        }),
+      });
     }
 
     res.status(200).send("OK");
-  } catch (error) {
-    console.error("Error:", error);
+  } catch (err) {
+    console.error("Error:", err);
     res.status(500).send("Internal Server Error");
   }
 }
