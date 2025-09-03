@@ -1,8 +1,10 @@
 {
   "name": "line-th-kr-translator",
   "version": "1.0.0",
+  "private": true,
   "type": "module",
-  "dependencies": {
-    "node-fetch": "3.3.2"
-  }
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {}
 }
